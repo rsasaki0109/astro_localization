@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "comparison": "same scalar maximum information; directional run changes only XY information shape",
+  "runs": [
+    {
+      "scene": "synth:craters",
+      "scalar_rmse_m": 68.0,
+      "directional_rmse_m": 55.2,
+      "scalar_over_directional_rmse_ratio": 1.231,
+      "directional_final_error_m": 88.7
+    },
+    {
+      "scene": "lola:tycho",
+      "scalar_rmse_m": 287.2,
+      "directional_rmse_m": 289.0,
+      "scalar_over_directional_rmse_ratio": 0.994,
+      "directional_final_error_m": 757.1
+    },
+    {
+      "scene": "lola:apollo11",
+      "scalar_rmse_m": 392.7,
+      "directional_rmse_m": 393.8,
+      "scalar_over_directional_rmse_ratio": 0.997,
+      "directional_final_error_m": 866.8
+    }
+  ],
+  "interpretation": "Directional information helps the synthetic anisotropic case but is effectively tied with scalar weighting on these two real scenes. Pre-solve risk detection and routing are the supported benefits; improved real-scene fusion accuracy requires calibration.",
+  "full_artifacts": "external SSD under predictive_localizability/four_factor_directional*.json and .png"
+}

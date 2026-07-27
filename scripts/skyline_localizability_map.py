@@ -37,6 +37,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from skyline_lock_demo import (  # noqa: E402
     load_lola_dem, render_horizon, best_yaw_ncc, uniqueness_margin,
 )
+from predictive_localizability import skyline_grid_observability  # noqa: E402
 from render_hazard_aware_navigation_demo import (  # noqa: E402
     GridPoint, astar,
 )
@@ -92,6 +93,14 @@ def main() -> int:
                     help="Star-tracker heading 1-sigma; lag window is +/- 3 sigma around known heading.")
     ap.add_argument("--loc-weight", type=float, default=12.0,
                     help="How strongly the aware route avoids low-localizability terrain.")
+    ap.add_argument("--routing-signal", choices=("margin", "directional"),
+                    default="margin",
+                    help="margin keeps the original global-alias route; directional "
+                    "uses pre-solve (x,y,yaw) observability.")
+    ap.add_argument("--noise-arcmin", type=float, default=8.0,
+                    help="Horizon extraction sigma for directional information.")
+    ap.add_argument("--yaw-scale-deg", type=float, default=5.0,
+                    help="Yaw perturbation scale used to compare yaw with one grid step.")
     # Default start/goal cross the dark exterior above Tycho's rim, so the
     # shortest path stays in aliased terrain and the aware route must detour
     # down onto the distinctive rim ring.
@@ -128,9 +137,21 @@ def main() -> int:
     loc_map = compute_localizability_map(
         preds, cand_xy, args.grid,
         prior_lag=0, window_bins=window_bins, excl_radius_m=2.0 * grid_step_m)
+    directional_map, _ = skyline_grid_observability(
+        preds,
+        grid_shape=(args.grid, args.grid),
+        grid_step_m=grid_step_m,
+        horizon_sigma_rad=math.radians(args.noise_arcmin / 60.0),
+        position_scale_m=grid_step_m,
+        yaw_scale_rad=math.radians(args.yaw_scale_deg),
+    )
 
     # Routing on the candidate grid (GridPoint.x = col, .y = row).
-    loc_norm = (loc_map - loc_map.min()) / max(1e-9, loc_map.max() - loc_map.min())
+    signal_map = loc_map if args.routing_signal == "margin" else directional_map
+    loc_norm = (
+        (signal_map - signal_map.min())
+        / max(1e-9, signal_map.max() - signal_map.min())
+    )
     base_cost = np.ones((args.grid, args.grid), dtype=np.float64)
     aware_cost = 1.0 + args.loc_weight * (1.0 - loc_norm)
 
@@ -142,20 +163,23 @@ def main() -> int:
     base_route = astar(base_cost, start, goal)
     aware_route = astar(aware_cost, start, goal)
 
-    base_m = route_localizability(base_route, loc_map)
-    aware_m = route_localizability(aware_route, loc_map)
+    base_m = route_localizability(base_route, signal_map)
+    aware_m = route_localizability(aware_route, signal_map)
     summary = {
         "scene": f"lola:{args.target}",
         "grid": args.grid,
         "grid_step_m": round(float(grid_step_m), 2),
         "loc_weight": args.loc_weight,
+        "routing_signal": args.routing_signal,
         "localizable_cell_fraction": round(float(np.mean(loc_map >= 0.05)), 4),
-        "shortest_route": base_m,
-        "localizability_aware_route": aware_m,
+        "mean_directional_reliability": round(float(directional_map.mean()), 6),
+        "shortest_route_signal_metrics": base_m,
+        "predictive_aware_route_signal_metrics": aware_m,
     }
     print(json.dumps(summary, indent=2))
 
-    _render(args, dem, extent_m, gx, gy, loc_map, base_route, aware_route, start, goal)
+    _render(args, dem, extent_m, gx, gy, signal_map,
+            base_route, aware_route, start, goal)
     if args.output_json is not None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         args.output_json.write_text(json.dumps(summary, indent=2))
@@ -178,14 +202,19 @@ def _render(args, dem, extent_m, gx, gy, loc_map, base_route, aware_route, start
     e_x, e_y = gx[goal.x], gy[goal.y]
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    aware_name = (
+        "localizability-aware"
+        if args.routing_signal == "margin"
+        else "predictive-observability-aware"
+    )
     fig.suptitle(
         f"Skyline localizability routing over {args.target.title()}  -  "
-        "don't-get-lost route stays on horizon-distinctive terrain", fontsize=13)
+        f"{aware_name} route avoids weak horizon geometry", fontsize=13)
 
     ax = axes[0]
     im = ax.imshow(dem, origin="lower", extent=[0, extent_m, 0, extent_m], cmap="terrain")
     ax.plot(bx, by, "--", color="red", lw=2.0, label="shortest")
-    ax.plot(ax_, ay, "-", color="cyan", lw=2.0, label="localizability-aware")
+    ax.plot(ax_, ay, "-", color="cyan", lw=2.0, label=aware_name)
     ax.scatter([sx, e_x], [sy, e_y], c="white", marker="o", s=60, edgecolors="k", zorder=5)
     ax.set_title("DEM (m) + routes"); ax.set_xlabel("x east (m)"); ax.set_ylabel("y north (m)")
     ax.legend(loc="upper left", fontsize=8)
@@ -196,7 +225,12 @@ def _render(args, dem, extent_m, gx, gy, loc_map, base_route, aware_route, start
                    cmap="magma", vmin=0.0, aspect="auto")
     ax.plot(bx, by, "--", color="red", lw=2.0)
     ax.plot(ax_, ay, "-", color="cyan", lw=2.0)
-    ax.set_title("horizon localizability map (1 - best competing match)")
+    signal_title = (
+        "global uniqueness margin"
+        if args.routing_signal == "margin"
+        else "pre-solve directional reliability"
+    )
+    ax.set_title(f"horizon routing signal: {signal_title}")
     ax.set_xlabel("x east (m)"); ax.set_ylabel("y north (m)")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
@@ -207,9 +241,10 @@ def _render(args, dem, extent_m, gx, gy, loc_map, base_route, aware_route, start
         s = np.concatenate([[0.0], np.cumsum([math.hypot(b.x - a.x, b.y - a.y)
                                               for a, b in zip(route[:-1], route[1:])])])
         ax.plot(s / s[-1], vals, color=color, lw=1.6, label=label)
-    ax.axhline(0.05, color="gray", ls=":", lw=1.0, label="aliased (<0.05)")
-    ax.set_title("localizability along route")
-    ax.set_xlabel("route fraction"); ax.set_ylabel("localizability margin")
+    if args.routing_signal == "margin":
+        ax.axhline(0.05, color="gray", ls=":", lw=1.0, label="aliased (<0.05)")
+    ax.set_title(f"{args.routing_signal} signal along route")
+    ax.set_xlabel("route fraction"); ax.set_ylabel("routing reliability")
     ax.legend(fontsize=8)
 
     fig.tight_layout(rect=[0, 0, 1, 0.95])

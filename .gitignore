@@ -11,3 +11,4 @@ datasets/lro_cache/
 __pycache__/
 *.pyc
 .cache/
+.astro_navigation.local.json

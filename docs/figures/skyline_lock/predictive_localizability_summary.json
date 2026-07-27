@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "method": {
+    "local": "finite-difference raw-horizon Fisher information",
+    "global": "best-vs-competing-position uniqueness margin",
+    "combined": "product of local and global reliability",
+    "state": [
+      "x",
+      "y",
+      "yaw"
+    ],
+    "factor_graph_used": false
+  },
+  "settings": {
+    "targets": [
+      "tycho",
+      "apollo11",
+      "shackleton"
+    ],
+    "ldem_ppd": 16,
+    "half_width_deg": 2.0,
+    "grid": 7,
+    "grid_margin_frac": 0.18,
+    "n_az": 120,
+    "n_range": 100,
+    "mast_height_m": 2.0,
+    "position_delta_m": 150.0,
+    "yaw_delta_deg": 0.5,
+    "yaw_scale_deg": 5.0,
+    "yaw_sigma_deg": 2.0,
+    "noise_arcmin": 8.0,
+    "trials": 20,
+    "truth_jitter_frac": 0.35,
+    "margin_reference": 0.15,
+    "seed": 23
+  },
+  "scenes": [
+    {
+      "target": "tycho",
+      "label": "Tycho highland",
+      "grid": 7,
+      "extent_m": 121293.402,
+      "grid_step_m": 12937.963,
+      "correlation_with_p90_error": {
+        "local_observability_risk": 0.2824,
+        "uniqueness_margin_risk": 0.096,
+        "combined_risk": 0.2399
+      },
+      "mean_wrong_lock_rate": 0.122449
+    },
+    {
+      "target": "apollo11",
+      "label": "Apollo 11 mare",
+      "grid": 7,
+      "extent_m": 121293.402,
+      "grid_step_m": 12937.963,
+      "correlation_with_p90_error": {
+        "local_observability_risk": 0.4331,
+        "uniqueness_margin_risk": -0.3058,
+        "combined_risk": 0.1914
+      },
+      "mean_wrong_lock_rate": 0.046939
+    },
+    {
+      "target": "shackleton",
+      "label": "Shackleton polar",
+      "grid": 7,
+      "extent_m": 121293.402,
+      "grid_step_m": 12937.963,
+      "correlation_with_p90_error": {
+        "local_observability_risk": 0.4825,
+        "uniqueness_margin_risk": -0.0824,
+        "combined_risk": 0.2603
+      },
+      "mean_wrong_lock_rate": 0.228571
+    }
+  ],
+  "full_artifact": "external SSD; regenerate with the command in docs/predictive_localizability.md"
+}
