@@ -65,6 +65,11 @@ from factor_graph_fusion_demo import (  # noqa: E402
     make_truth_trajectory, true_yaw_series, simulate_vo, integrate,
     SkylineLocalizer, margin_to_sigma, fuse_positions,
 )
+from predictive_localizability import (  # noqa: E402
+    fuse_positions_directional,
+    normalized_information,
+    skyline_observability,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -167,7 +172,7 @@ class TrnLocalizer:
         self.half = max(2, int(round(0.5 * patch_m / app_px_to_m)))
         self.patch_m = patch_m
 
-    def fix(self, truth_xy, rng, noise_frac):
+    def _match(self, truth_xy, rng, noise_frac):
         cx = int(round(truth_xy[0] / self.app_px_to_m))
         cy = int(round(truth_xy[1] / self.app_px_to_m))
         h, w = self.app.shape
@@ -190,7 +195,39 @@ class TrnLocalizer:
                         (rr + th / 2.0) - (pk[0] + th / 2.0)) * self.app_px_to_m
         far = res[dist > 1.5 * self.patch_m]
         second = float(far.max()) if far.size else peak
-        return np.array([est_x, est_y], dtype=np.float64), float(peak - second), peak
+        return (
+            np.array([est_x, est_y], dtype=np.float64),
+            float(peak - second),
+            peak,
+            res,
+            pk,
+        )
+
+    def fix(self, truth_xy, rng, noise_frac):
+        """Return the legacy scalar-margin TRN fix tuple."""
+        estimate, margin, peak, _, _ = self._match(truth_xy, rng, noise_frac)
+        return estimate, margin, peak
+
+    def fix_with_observability(self, truth_xy, rng, noise_frac, *,
+                               score_sigma=0.01, position_scale_m=None):
+        """Return ``(estimate, margin, peak, XY ObservabilityReport)``.
+
+        Directional information comes from the raw 2-D match response before
+        the factor graph sees the absolute fix.
+        """
+        from predictive_localizability import trn_observability
+
+        estimate, margin, peak, response, peak_rc = self._match(
+            truth_xy, rng, noise_frac
+        )
+        report = trn_observability(
+            response,
+            peak_rc,
+            px_to_m=self.app_px_to_m,
+            score_sigma=score_sigma,
+            position_scale_m=position_scale_m or self.patch_m,
+        )
+        return estimate, margin, peak, report
 
 
 # --------------------------------------------------------------------------- #
@@ -247,6 +284,9 @@ def main() -> int:
     ap.add_argument("--trn-margin-ref", type=float, default=0.4)
     ap.add_argument("--trn-margin-floor", type=float, default=0.02)
     ap.add_argument("--trn-unique-margin", type=float, default=0.1)
+    ap.add_argument("--directional-information", action="store_true",
+                    help="Also solve with raw-measurement XY information matrices "
+                    "instead of scalar isotropic fix sigmas.")
     ap.add_argument("--output", type=Path,
                     default=REPO_ROOT / "outputs" / "factor_graph_fusion" / "four_factor_fusion.png")
     ap.add_argument("--output-json", type=Path, default=None)
@@ -275,7 +315,7 @@ def main() -> int:
     trn = TrnLocalizer(app, app_px_to_m, patch_m=args.trn_patch_frac * extent_m)
 
     # Skyline fixes (1-D horizon margin -> sigma).
-    sky_fixes, sky_records = [], []
+    sky_fixes, sky_directional_fixes, sky_records = [], [], []
     for k in range(0, args.n_poses, args.skyline_every):
         est_xy, margin, ncc = sky.fix(tuple(truth[k]), truth_yaw[k], star_yaw[k],
                                       rng, args.noise_arcmin)
@@ -284,19 +324,47 @@ def main() -> int:
                                 sigma_cap_m=args.sigma_cap_m)
         err = float(math.hypot(est_xy[0] - truth[k, 0], est_xy[1] - truth[k, 1]))
         sky_fixes.append((k, est_xy, sigma))
+        if args.directional_information:
+            _, obs = skyline_observability(
+                sky._horizon, tuple(truth[k]), truth_yaw[k],
+                position_delta_m=max(0.5 * sky.grid_step_m, px_to_m),
+                yaw_delta_rad=math.radians(0.5),
+                horizon_sigma_rad=math.radians(args.noise_arcmin / 60.0),
+                position_scale_m=sky.grid_step_m,
+                yaw_scale_rad=math.radians(args.yaw_sigma_deg),
+            )
+            info = normalized_information(
+                obs, ("x", "y"), sigma_best=sigma,
+                reliability=1.0, information_floor=1e-3,
+            )
+            sky_directional_fixes.append((k, est_xy, info))
         sky_records.append({"pose": k, "margin": round(margin, 4), "best_ncc": round(ncc, 4),
                             "sigma_m": round(sigma, 1), "fix_err_m": round(err, 1),
                             "unique": bool(margin >= 0.05)})
 
     # TRN fixes (2-D image margin -> sigma).
-    trn_fixes, trn_records = [], []
+    trn_fixes, trn_directional_fixes, trn_records = [], [], []
     for k in range(0, args.n_poses, args.trn_every):
-        est_xy, margin, peak = trn.fix(tuple(truth[k]), rng, args.trn_noise_frac)
+        if args.directional_information:
+            est_xy, margin, peak, obs = trn.fix_with_observability(
+                tuple(truth[k]), rng, args.trn_noise_frac,
+                position_scale_m=args.trn_patch_frac * extent_m,
+            )
+        else:
+            est_xy, margin, peak = trn.fix(
+                tuple(truth[k]), rng, args.trn_noise_frac
+            )
         sigma = margin_to_sigma(margin, sigma_lock_m=args.trn_sigma_lock_m,
                                 margin_ref=args.trn_margin_ref,
                                 margin_floor=args.trn_margin_floor, sigma_cap_m=args.sigma_cap_m)
         err = float(math.hypot(est_xy[0] - truth[k, 0], est_xy[1] - truth[k, 1]))
         trn_fixes.append((k, est_xy, sigma))
+        if args.directional_information:
+            info = normalized_information(
+                obs, ("x", "y"), sigma_best=sigma,
+                reliability=1.0, information_floor=1e-3,
+            )
+            trn_directional_fixes.append((k, est_xy, info))
         trn_records.append({"pose": k, "margin": round(margin, 4), "peak_ncc": round(peak, 4),
                            "sigma_m": round(sigma, 1), "fix_err_m": round(err, 1),
                            "unique": bool(margin >= args.trn_unique_margin)})
@@ -308,12 +376,26 @@ def main() -> int:
                                 args.sigma_prior_m, args.sigma_vo_m, sky_fixes)
     est4, cov4 = fuse_positions(args.n_poses, vo_deltas, truth[0],
                                 args.sigma_prior_m, args.sigma_vo_m, sky_fixes + trn_fixes)
+    est_directional = cov_directional = None
+    if args.directional_information:
+        est_directional, cov_directional = fuse_positions_directional(
+            args.n_poses,
+            vo_deltas,
+            truth[0],
+            sigma_prior=args.sigma_prior_m,
+            sigma_vo=args.sigma_vo_m,
+            fixes=sky_directional_fixes + trn_directional_fixes,
+        )
 
     def rmse(a):
         return float(np.sqrt(np.mean(np.sum((a - truth) ** 2, axis=1))))
     vo_err = np.linalg.norm(vo_only - truth, axis=1)
     err3 = np.linalg.norm(est3 - truth, axis=1)
     err4 = np.linalg.norm(est4 - truth, axis=1)
+    err_directional = (
+        np.linalg.norm(est_directional - truth, axis=1)
+        if est_directional is not None else None
+    )
     pos_std4 = np.sqrt(cov4[:, 0, 0] + cov4[:, 1, 1])
 
     summary = {
@@ -333,14 +415,26 @@ def main() -> int:
         "fused4_max_err_m": round(float(err4.max()), 1),
         "fused4_vs_vo_x": round(rmse(vo_only) / max(rmse(est4), 1e-9), 2),
         "fused4_vs_fused3_x": round(rmse(est3) / max(rmse(est4), 1e-9), 2),
+        "directional_information_enabled": args.directional_information,
         "skyline_fixes": sky_records,
         "trn_fixes": trn_records,
     }
+    if est_directional is not None:
+        summary.update({
+            "fused4_directional_rmse_m": round(rmse(est_directional), 1),
+            "fused4_directional_final_err_m":
+                round(float(err_directional[-1]), 1),
+            "directional_vs_scalar_rmse_x":
+                round(rmse(est4) / max(rmse(est_directional), 1e-9), 3),
+        })
     print(json.dumps(summary, indent=2))
 
     _render(args, dem, app, app_px_to_m, extent_m, truth, vo_only, est3, est4,
             cov4, pos_std4, sky_fixes, sky_records, trn_fixes, trn_records,
-            vo_err, err3, err4, scene, app_kind)
+            vo_err, err3, err4, scene, app_kind,
+            est_directional=est_directional,
+            err_directional=err_directional,
+            cov_directional=cov_directional)
 
     if args.output_json is not None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
@@ -351,7 +445,8 @@ def main() -> int:
 
 def _render(args, dem, app, app_px_to_m, extent_m, truth, vo_only, est3, est4,
             cov4, pos_std4, sky_fixes, sky_records, trn_fixes, trn_records,
-            vo_err, err3, err4, scene, app_kind) -> None:
+            vo_err, err3, err4, scene, app_kind, *,
+            est_directional=None, err_directional=None, cov_directional=None) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -373,6 +468,9 @@ def _render(args, dem, app, app_px_to_m, extent_m, truth, vo_only, est3, est4,
     ax.plot(vo_only[:, 0], vo_only[:, 1], "--", color="red", lw=1.6, label="VO only")
     ax.plot(est3[:, 0], est3[:, 1], "-", color="#ffd24d", lw=1.6, label="fused (no TRN)")
     ax.plot(est4[:, 0], est4[:, 1], "-", color="cyan", lw=2.0, label="fused + TRN")
+    if est_directional is not None:
+        ax.plot(est_directional[:, 0], est_directional[:, 1], "-",
+                color="#ff66cc", lw=1.8, label="directional information")
     for k in range(0, len(est4), max(1, len(est4) // 12)):
         sx = 2.0 * math.sqrt(max(cov4[k, 0, 0], 0.0))
         sy = 2.0 * math.sqrt(max(cov4[k, 1, 1], 0.0))
@@ -398,6 +496,9 @@ def _render(args, dem, app, app_px_to_m, extent_m, truth, vo_only, est3, est4,
     ax.plot(vo_err, "--", color="red", lw=1.8, label="VO only")
     ax.plot(err3, "-", color="#e0a800", lw=1.8, label="fused (star+VO+skyline)")
     ax.plot(err4, "-", color="cyan", lw=2.2, label="fused + TRN")
+    if err_directional is not None:
+        ax.plot(err_directional, "-", color="#ff66cc", lw=2.0,
+                label="directional information")
     for (k, _, _), rec in zip(sky_fixes, sky_records):
         ax.axvline(k, color=(SKY_U if rec["unique"] else SKY_A), lw=0.8, alpha=0.35)
     ax.set_title("position error vs pose")

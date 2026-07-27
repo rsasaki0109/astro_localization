@@ -39,6 +39,7 @@ from skyline_lock_demo import load_lola_dem, render_horizon  # noqa: E402
 from skyline_localizability_map import (  # noqa: E402
     compute_localizability_map, route_localizability,
 )
+from predictive_localizability import skyline_grid_observability  # noqa: E402
 from render_hazard_aware_navigation_demo import GridPoint  # noqa: E402
 
 
@@ -102,6 +103,10 @@ def main() -> int:
     ap.add_argument("--mast-height-m", type=float, default=2.0)
     ap.add_argument("--yaw-sigma-deg", type=float, default=5.0)
     ap.add_argument("--loc-weight", type=float, default=12.0)
+    ap.add_argument("--routing-signal", choices=("margin", "directional"),
+                    default="margin")
+    ap.add_argument("--noise-arcmin", type=float, default=8.0)
+    ap.add_argument("--yaw-scale-deg", type=float, default=5.0)
     ap.add_argument("--start-frac", type=float, nargs=2, default=(0.1, 0.82))
     ap.add_argument("--goal-frac", type=float, nargs=2, default=(0.9, 0.82))
     ap.add_argument("--search-frames", type=int, default=20)
@@ -137,9 +142,23 @@ def main() -> int:
                        n_az=A, r_min_m=r_min, r_max_m=r_max, n_range=args.n_range)
         for xy in cand_xy])
     window_bins = max(1, int(math.ceil(3.0 * args.yaw_sigma_deg * bins_per_deg)))
-    loc_map = compute_localizability_map(
+    margin_map = compute_localizability_map(
         preds, cand_xy, args.grid, prior_lag=0, window_bins=window_bins,
         excl_radius_m=2.0 * grid_step_m)
+    directional_map, _ = skyline_grid_observability(
+        preds,
+        grid_shape=(args.grid, args.grid),
+        grid_step_m=grid_step_m,
+        horizon_sigma_rad=math.radians(args.noise_arcmin / 60.0),
+        position_scale_m=grid_step_m,
+        yaw_scale_rad=math.radians(args.yaw_scale_deg),
+    )
+    loc_map = margin_map if args.routing_signal == "margin" else directional_map
+    signal_name = (
+        "global uniqueness margin"
+        if args.routing_signal == "margin"
+        else "pre-solve directional reliability"
+    )
 
     loc_norm = (loc_map - loc_map.min()) / max(1e-9, loc_map.max() - loc_map.min())
     base_cost = np.ones((args.grid, args.grid), dtype=np.float64)
@@ -154,9 +173,9 @@ def main() -> int:
     aware_route, aware_expanded = astar_traced(aware_cost, start, goal)
     base_m = route_localizability(base_route, loc_map)
     aware_m = route_localizability(aware_route, loc_map)
-    print(f"  shortest mean loc {base_m['mean_localizability']:.3f} (aliased frac "
+    print(f"  shortest mean signal {base_m['mean_localizability']:.3f} (weak frac "
           f"{base_m['low_loc_fraction']:.2f}); aware mean loc "
-          f"{aware_m['mean_localizability']:.3f} (aliased frac {aware_m['low_loc_fraction']:.2f}); "
+          f"{aware_m['mean_localizability']:.3f} (weak frac {aware_m['low_loc_fraction']:.2f}); "
           f"detour x{aware_m['detour_ratio']:.2f}; expanded {len(aware_expanded)} cells")
 
     bx = np.array([gx[p.x] for p in base_route]); byr = np.array([gy[p.y] for p in base_route])
@@ -201,19 +220,19 @@ def main() -> int:
     for i in range(1, args.search_frames + 1):
         k = max(1, int(round(n_exp * i / args.search_frames)))
         fig, axes = base_fig()
-        fig.suptitle("Skyline localizability routing — Act 1: aware A* avoids the dark (aliased) "
-                     "interior", fontsize=12.0, color="#1f77ff")
+        fig.suptitle(f"Skyline routing — Act 1: A* expands through stronger {signal_name}",
+                     fontsize=12.0, color="#1f77ff")
         ax = axes[0]
         ax.scatter(ex[:k], ey[:k], c="#19c819", marker="s", s=10, alpha=0.5, zorder=4,
                    label="expanded cells")
         ax.scatter(ex[k - 1], ey[k - 1], c="cyan", marker="s", s=40, edgecolors="k", zorder=6)
-        ax.set_title(f"localizability map (bright = localizable) — expanded {k}/{n_exp}", fontsize=10)
+        ax.set_title(f"{signal_name} (bright = reliable) — expanded {k}/{n_exp}", fontsize=10)
         ax.legend(loc="upper left", fontsize=8)
         ax = axes[1]
-        ax.axhline(0.05, color="gray", ls=":", lw=1.0, label="aliased (<0.05)")
+        ax.axhline(0.05, color="gray", ls=":", lw=1.0, label="weak (<0.05)")
         ax.set_xlim(0, 1); ax.set_ylim(0.0, max(0.2, float(loc_map.max()) * 1.05))
-        ax.set_title("localizability along route (fills in Act 2)", fontsize=10)
-        ax.set_xlabel("route fraction"); ax.set_ylabel("localizability margin")
+        ax.set_title("routing signal along route (fills in Act 2)", fontsize=10)
+        ax.set_xlabel("route fraction"); ax.set_ylabel("routing reliability")
         ax.legend(fontsize=8, loc="upper right")
         fig.tight_layout(rect=[0, 0, 1, 0.95])
         grab(fig)
@@ -225,26 +244,28 @@ def main() -> int:
         kb = max(1, int(round(len(base_route) * t)))
         ka = max(1, int(round(len(aware_route) * t)))
         fig, axes = base_fig()
-        fig.suptitle("Skyline localizability routing — Act 2: shortest dives into aliased terrain, "
-                     "aware stays localizable", fontsize=11.5, color="#137333")
+        fig.suptitle(f"Skyline routing — Act 2: shortest vs {signal_name}-aware",
+                     fontsize=11.5, color="#137333")
         ax = axes[0]
         ax.scatter(ex, ey, c="#19c819", marker="s", s=8, alpha=0.18, zorder=3)
         ax.plot(bx[:kb], byr[:kb], "--", color="red", lw=2.2, label="shortest", zorder=5)
-        ax.plot(ax_[:ka], ay[:ka], "-", color="cyan", lw=2.2, label="localizability-aware", zorder=5)
+        ax.plot(ax_[:ka], ay[:ka], "-", color="cyan", lw=2.2,
+                label="predictive-aware" if args.routing_signal == "directional"
+                else "localizability-aware", zorder=5)
         ax.scatter(bx[kb - 1], byr[kb - 1], c="red", s=55, edgecolors="k", zorder=7)
         ax.scatter(ax_[ka - 1], ay[ka - 1], c="cyan", s=55, edgecolors="k", zorder=7)
         ax.set_title(f"routes (aware detour ×{aware_m['detour_ratio']:.2f})", fontsize=10)
         ax.legend(loc="upper left", fontsize=8)
         ax = axes[1]
-        ax.axhline(0.05, color="gray", ls=":", lw=1.0, label="aliased (<0.05)")
+        ax.axhline(0.05, color="gray", ls=":", lw=1.0, label="weak (<0.05)")
         nb = max(1, int(round(len(bf) * t))); na = max(1, int(round(len(af) * t)))
         ax.plot(bf[:nb], bv[:nb], "-", color="red", lw=1.8,
-                label=f"shortest (aliased {base_m['low_loc_fraction']*100:.0f}%)")
+                label=f"shortest (weak {base_m['low_loc_fraction']*100:.0f}%)")
         ax.plot(af[:na], av[:na], "-", color="cyan", lw=1.8,
-                label=f"aware (aliased {aware_m['low_loc_fraction']*100:.0f}%)")
+                label=f"aware (weak {aware_m['low_loc_fraction']*100:.0f}%)")
         ax.set_xlim(0, 1); ax.set_ylim(0.0, max(0.2, float(loc_map.max()) * 1.05))
-        ax.set_title("localizability along route", fontsize=10)
-        ax.set_xlabel("route fraction"); ax.set_ylabel("localizability margin")
+        ax.set_title(f"{signal_name} along route", fontsize=10)
+        ax.set_xlabel("route fraction"); ax.set_ylabel("routing reliability")
         ax.legend(fontsize=8, loc="upper right")
         fig.tight_layout(rect=[0, 0, 1, 0.95])
         grab(fig)
